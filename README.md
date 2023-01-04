@@ -1,6 +1,16 @@
 # doc2doc
 Document level translation repo
 
+## Quick Start
+
+##### Installation
+Just install fairseq following [fairseq doc](./fairseq/README.md)
+
+##### Prepare datasets
+Download iwslt17, nc2016, and europarl7 from [SAN](https://github.com/sameenmaruf/selective-attn/tree/master/data) and put them in this folder.
+
+
+
 
 ## Implements models
 - [g-transformer](https://aclanthology.org/2021.acl-long.267/), [Original repo](https://github.com/baoguangsheng/g-transformer)

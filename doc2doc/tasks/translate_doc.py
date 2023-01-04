@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass, field
 
 import torch
 from fairseq import metrics
