@@ -10,25 +10,33 @@ from torch import Tensor
 
 from .utils import tokens2tags
 
-class GTransformerEncoderLayer(TransformerEncoderLayerBase):
 
+class GTransformerEncoderLayer(TransformerEncoderLayerBase):
     def __init__(self, cfg, return_fc=False):
         super().__init__(cfg, return_fc)
         self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
         self.self_attn_gate = nn.Sequential(nn.Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
 
-
     def upgrade_state_dict_named(self, state_dict, name):
         super().upgrade_state_dict_named(state_dict, name)
         attn_name_map = {"self_attn": "self_attn_global"}
         for old, new in attn_name_map.items():
-            for m in ["in_proj_weight", "in_proj_bias", "out_proj.weight", "out_proj.bias",
-                      "k_proj.weight", "k_proj.bias", "q_proj.weight", "q_proj.bias", "v_proj.weight", "v_proj.bias"]:
+            for m in [
+                "in_proj_weight",
+                "in_proj_bias",
+                "out_proj.weight",
+                "out_proj.bias",
+                "k_proj.weight",
+                "k_proj.bias",
+                "q_proj.weight",
+                "q_proj.bias",
+                "v_proj.weight",
+                "v_proj.bias",
+            ]:
                 k_old = "{}.{}.{}".format(name, old, m)
                 k_new = "{}.{}.{}".format(name, new, m)
                 if k_old in state_dict and k_new not in state_dict:
                     state_dict[k_new] = state_dict[k_old].clone()
-
 
     def forward(
         self,
@@ -57,9 +65,7 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         # the attention weight (before softmax) for some padded element in query
         # will become -inf, which results in NaN in model parameters
         if attn_mask is not None:
-            attn_mask = attn_mask.masked_fill(
-                attn_mask.to(torch.bool), -1e8 if x.dtype == torch.float32 else -1e4
-            )
+            attn_mask = attn_mask.masked_fill(attn_mask.to(torch.bool), -1e8 if x.dtype == torch.float32 else -1e4)
 
         residual = x
         if self.normalize_before:
@@ -74,13 +80,7 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         )
 
         # global attention
-        x_global, _ = self.self_attn_global(
-            query=x,
-            key=x,
-            value=x,
-            key_padding_mask=encoder_padding_mask,
-            need_weights=False
-        )
+        x_global, _ = self.self_attn_global(query=x, key=x, value=x, key_padding_mask=encoder_padding_mask, need_weights=False)
         gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
         x = gate * x_local + (1 - gate) * x_global
         # end global attention
@@ -109,14 +109,17 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         return x
 
 
-
 class GTransformerEncoder(TransformerEncoderBase):
     def __init__(self, cfg, dictionary, embed_tokens, return_fc=False):
+        origin_encoder_ctx_layers = cfg.encoder.encoder_ctx_layers
+        gtransformer_encoder_ctx_layers = 2  # TODO: add this to config
+        assert origin_encoder_ctx_layers > gtransformer_encoder_ctx_layers
+        cfg.encoder.encoder_ctx_layers = origin_encoder_ctx_layers - gtransformer_encoder_ctx_layers
         super().__init__(cfg, dictionary, embed_tokens, return_fc)
-        for _ in range(cfg.encoder.encoder_ctx_layers):
+        cfg.encoder.encoder_ctx_layers = origin_encoder_ctx_layers
+        for _ in range(gtransformer_encoder_ctx_layers):
             self.layers.extend([GTransformerEncoderLayer(cfg)])
-        self.eod = '[{}]'.format(cfg.source_lang)
-
+        self.eod = "[{}]".format(cfg.source_lang)
 
     def build_group_encoder_layer(self, cfg):
         layer = GTransformerEncoderLayer(cfg, return_fc=self.return_fc)
@@ -132,13 +135,11 @@ class GTransformerEncoder(TransformerEncoderBase):
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
 
-
     def forward_embedding(self, src_tokens):
         # tags for each token
         src_tags = tokens2tags(self.dictionary, src_tokens, self.eod)
         x, embed = super().forward_embedding(src_tokens, src_tags)
         return x, embed, src_tags
-
 
     def forward(
         self,
@@ -172,15 +173,11 @@ class GTransformerEncoder(TransformerEncoderBase):
         """
         # compute padding mask
         encoder_padding_mask = src_tokens.eq(self.padding_idx)
-        has_pads = (
-            torch.tensor(src_tokens.device.type == "xla") or encoder_padding_mask.any()
-        )
+        has_pads = torch.tensor(src_tokens.device.type == "xla") or encoder_padding_mask.any()
         x, encoder_embedding, src_tags = self.forward_embedding(src_tokens, token_embeddings)
 
         # account for padding while computing the representation
-        x = x * (
-            1 - encoder_padding_mask.unsqueeze(-1).type_as(x) * has_pads.type_as(x)
-        )
+        x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x) * has_pads.type_as(x))
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -197,9 +194,11 @@ class GTransformerEncoder(TransformerEncoderBase):
 
         # encoder layers
         for layer in self.layers:
-            lr = layer(
-                x, encoder_padding_mask=encoder_padding_mask if has_pads else None, attn_mask=local_attn_mask
-            )
+            if isinstance(layer, GTransformerEncoderLayer):
+                attn_mask = local_attn_mask
+            else:
+                attn_mask = None
+            lr = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None, attn_mask=attn_mask)
 
             if isinstance(lr, tuple) and len(lr) == 2:
                 x, fc_result = lr
@@ -212,7 +211,6 @@ class GTransformerEncoder(TransformerEncoderBase):
                 encoder_states.append(x)
                 fc_results.append(fc_result)
 
-
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
@@ -220,12 +218,7 @@ class GTransformerEncoder(TransformerEncoderBase):
         # `forward` so we use a dictionary instead.
         # TorchScript does not support mixed values so the values are all lists.
         # The empty list is equivalent to None.
-        src_lengths = (
-            src_tokens.ne(self.padding_idx)
-            .sum(dim=1, dtype=torch.int32)
-            .reshape(-1, 1)
-            .contiguous()
-        )
+        src_lengths = src_tokens.ne(self.padding_idx).sum(dim=1, dtype=torch.int32).reshape(-1, 1).contiguous()
         return {
             "encoder_out": [x],  # T x B x C
             "encoder_padding_mask": [encoder_padding_mask],  # B x T
