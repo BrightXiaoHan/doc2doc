@@ -14,7 +14,7 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
 
     def __init__(self, cfg, return_fc=False):
         super().__init__(cfg, return_fc)
-        self.self_attn_global = self.build_self_attention(self.embed_dim, cfg)
+        self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
         self.self_attn_gate = nn.Sequential(nn.Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
 
 
@@ -64,7 +64,7 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        x, _ = self.self_attn(
+        x_local, _ = self.self_attn(
             query=x,
             key=x,
             value=x,
@@ -81,8 +81,8 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
             key_padding_mask=encoder_padding_mask,
             need_weights=False
         )
-        gate = self.self_attn_gate(torch.cat([x, x_global], dim=-1))
-        x = gate * x + (1 - gate) * x_global
+        gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
+        x = gate * x_local + (1 - gate) * x_global
         # end global attention
 
         x = self.dropout_module(x)
