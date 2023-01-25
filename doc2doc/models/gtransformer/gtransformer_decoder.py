@@ -1,4 +1,3 @@
-from threading import local
 from typing import Dict, List, Optional
 
 import torch
