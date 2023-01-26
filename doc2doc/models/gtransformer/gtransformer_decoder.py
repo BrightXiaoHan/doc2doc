@@ -42,16 +42,16 @@ class GTransformerDecoderLayer(TransformerDecoderLayerBase):
         self,
         x,
         encoder_out: Optional[torch.Tensor] = None,
-        local_encoder_attn_mask: Optional[torch.Tensor] = None,
         encoder_padding_mask: Optional[torch.Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         prev_self_attn_state: Optional[List[torch.Tensor]] = None,
         prev_attn_state: Optional[List[torch.Tensor]] = None,
         self_attn_mask: Optional[torch.Tensor] = None,
-        local_self_attn_mask: Optional[torch.Tensor] = None,
         self_attn_padding_mask: Optional[torch.Tensor] = None,
         need_attn: bool = False,
         need_head_weights: bool = False,
+        local_encoder_attn_mask: Optional[torch.Tensor] = None,
+        local_self_attn_mask: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -242,7 +242,6 @@ class GTransformerDecoder(TransformerDecoderBase):
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                 - a dictionary with any model-specific outputs
         """
-        bs, slen = prev_output_tokens.size()
         if alignment_layer is None:
             alignment_layer = self.num_layers - 1
 
@@ -263,19 +262,6 @@ class GTransformerDecoder(TransformerDecoderBase):
             if positions is not None:
                 positions = positions[:, -1:]
 
-        # G-Transformer embed tags
-        prev_output_tags = tokens2tags(self.dictionary, prev_output_tokens, self.eod)
-        decoder_tags = prev_output_tags
-
-        encoder_local_mask = None
-        local_attn_mask = None
-        global_attn_mask = None
-        # cross attention
-        encoder_local_mask = encoder_out.encoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
-        encoder_local_mask &= 0 != decoder_tags.unsqueeze(2)
-        # self attention
-        local_attn_mask = prev_output_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
-        local_attn_mask &= 0 != decoder_tags.unsqueeze(2)
 
         # Prevent torchscript exporting issue for dynamic quant embedding
         prev_output_tokens = prev_output_tokens.contiguous()
@@ -302,6 +288,17 @@ class GTransformerDecoder(TransformerDecoderBase):
         self_attn_padding_mask: Optional[Tensor] = None
         if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
+        
+        # G-Transformer embed tags
+        prev_output_tags = tokens2tags(self.dictionary, prev_output_tokens, self.eod)
+        decoder_tags = prev_output_tags
+
+        # G-Transformer local attention mask for cross-attention
+        local_encoder_attn_mask = encoder_out.encoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
+        local_encoder_attn_mask &= 0 != decoder_tags.unsqueeze(2)
+        # G-Transformer local attention mask for self-attention
+        local_self_attn_mask = prev_output_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
+        local_self_attn_mask &= 0 != decoder_tags.unsqueeze(2)
 
         # decoder layers
         attn: Optional[Tensor] = None
@@ -309,12 +306,23 @@ class GTransformerDecoder(TransformerDecoderBase):
         for idx, layer in enumerate(self.layers):
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
+                local_self_attn_mask &= self_attn_mask
             else:
                 self_attn_mask = None
 
             if isinstance(layer, GTransformerDecoderLayer):
-                pass
-
+                x, layer_attn, _ = layer(
+                    x,
+                    enc,
+                    padding_mask,
+                    incremental_state,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_attn=bool((idx == alignment_layer)),
+                    need_head_weights=bool((idx == alignment_layer)),
+                    local_encoder_attn_mask=local_encoder_attn_mask,
+                    local_self_attn_mask=local_self_attn_mask,
+                )
             else:
                 x, layer_attn, _ = layer(
                     x,
