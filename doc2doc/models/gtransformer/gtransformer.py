@@ -1,3 +1,5 @@
+from dataclasses import dataclass, field
+
 from fairseq.dataclass.utils import gen_parser_from_dataclass
 from fairseq.models import register_model, register_model_architecture
 from fairseq.models.transformer.transformer_base import TransformerModelBase
@@ -10,6 +12,15 @@ from fairseq.models.transformer.transformer_config import (
 
 from doc2doc.models.gtransformer.gtransformer_decoder import GTransformerDecoder
 from doc2doc.models.gtransformer.gtransformer_encoder import GTransformerEncoder
+
+
+@dataclass
+class GTransformerConfig(TransformerConfig):
+    """Configuration for GTransformer."""
+
+    encoder_ctx_layers: int = field(default=2, metadata={"help": "number of encoder layers with global context"})
+    decoder_ctx_layers: int = field(default=2, metadata={"help": "number of decoder layers with global context"})
+    cross_ctx_layers: int = field(default=2, metadata={"help": "number of cross attention layers with global context"})
 
 
 @register_model("gtransformer")
@@ -28,7 +39,7 @@ class GTransformerModel(TransformerModelBase):
         """Add model-specific arguments to the parser."""
         # we want to build the args recursively in this case.
         # do not set defaults so that settings defaults from various architectures still works
-        gen_parser_from_dataclass(parser, TransformerConfig(), delete_default=True, with_prefix="")
+        gen_parser_from_dataclass(parser, GTransformerConfig(), delete_default=True, with_prefix="")
 
     @classmethod
     def build_model(cls, args, task):
