@@ -8,18 +8,25 @@ from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.transformer_layer import TransformerEncoderLayerBase
 from torch import Tensor
 
-from .utils import tokens2tags
+from .utils import Linear, tokens2tags
 
 
 class GTransformerEncoderLayer(TransformerEncoderLayerBase):
-    def __init__(self, cfg, return_fc=False):
+    def __init__(self, cfg, return_fc=False, global_ctx=False):
         super().__init__(cfg, return_fc)
-        self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
-        self.self_attn_gate = nn.Sequential(nn.Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
+        self.global_ctx = global_ctx
+        if global_ctx:
+            self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
+            self.self_attn_gate = nn.Sequential(Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
+        else:
+            self.self_attn_local = None
+            self.self_attn_gate = None
 
     def upgrade_state_dict_named(self, state_dict, name):
         super().upgrade_state_dict_named(state_dict, name)
-        attn_name_map = {"self_attn": "self_attn_global"}
+        if not self.global_ctx:
+            return
+        attn_name_map = {"self_attn": "self_attn_local"}
         for old, new in attn_name_map.items():
             for m in [
                 "in_proj_weight",
@@ -37,6 +44,17 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
                 k_new = "{}.{}.{}".format(name, new, m)
                 if k_old in state_dict and k_new not in state_dict:
                     state_dict[k_new] = state_dict[k_old].clone()
+
+        # if initailized from a normal transformer, we need to add the attn gate
+        attn_gate_weight_name = "{}.self_attn_gate.0.weight".format(name)
+        attn_gate_bias_name = "{}.self_attn_gate.0.bias".format(name)
+
+        if attn_gate_weight_name not in state_dict:
+            # init with the original value
+            state_dict[attn_gate_weight_name] = self.self_attn_gate[0].weight.clone()
+
+        if attn_gate_bias_name not in state_dict:
+            state_dict[attn_gate_bias_name] = self.self_attn_gate[0].bias.clone()
 
     def forward(
         self,
@@ -70,20 +88,30 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        x_local, _ = self.self_attn(
-            query=x,
-            key=x,
-            value=x,
-            key_padding_mask=encoder_padding_mask,
-            need_weights=False,
-            attn_mask=attn_mask,
-        )
-
-        # global attention
-        x_global, _ = self.self_attn_global(query=x, key=x, value=x, key_padding_mask=encoder_padding_mask, need_weights=False)
-        gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
-        x = gate * x_local + (1 - gate) * x_global
-        # end global attention
+        
+        # Key changes of GTransformer
+        if self.global_ctx:
+            x_local, _ = self.self_attn_local(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=encoder_padding_mask,
+                need_weights=False,
+                attn_mask=attn_mask,
+            )
+            x_global, _ = self.self_attn(query=x, key=x, value=x, key_padding_mask=encoder_padding_mask, need_weights=False)
+            gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
+            x = gate * x_local + (1 - gate) * x_global
+        else:
+            x, _ = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=encoder_padding_mask,
+                need_weights=False,
+                attn_mask=attn_mask,
+            )
+        # Key changes of GTransformer end
 
         x = self.dropout_module(x)
         x = self.residual_connection(x, residual)
@@ -111,15 +139,28 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
 
 class GTransformerEncoder(TransformerEncoderBase):
     def __init__(self, cfg, dictionary, embed_tokens, return_fc=False):
-        origin_encoder_ctx_layers = cfg.encoder.encoder_ctx_layers
-        gtransformer_encoder_ctx_layers = 2  # TODO: add this to config
-        assert origin_encoder_ctx_layers > gtransformer_encoder_ctx_layers
-        cfg.encoder.encoder_ctx_layers = origin_encoder_ctx_layers - gtransformer_encoder_ctx_layers
+        origin_encoder_layers = cfg.encoder_layers
+        gtransformer_encoder_ctx_layers = cfg.encoder_ctx_layers
+        assert origin_encoder_layers > gtransformer_encoder_ctx_layers
+        cfg.encoder_layers = origin_encoder_layers - gtransformer_encoder_ctx_layers
         super().__init__(cfg, dictionary, embed_tokens, return_fc)
-        cfg.encoder.encoder_ctx_layers = origin_encoder_ctx_layers
+        cfg.encoder_layers = origin_encoder_layers
         for _ in range(gtransformer_encoder_ctx_layers):
-            self.layers.extend([GTransformerEncoderLayer(cfg)])
+            self.layers.extend([self.build_group_encoder_layer(cfg)])
         self.eod = "[{}]".format(cfg.source_lang)
+
+    def build_encoder_layer(self, cfg):
+        layer = GTransformerEncoderLayer(cfg, return_fc=self.return_fc)
+        # migarate from super class
+        checkpoint = cfg.checkpoint_activations
+        if checkpoint:
+            offload_to_cpu = cfg.offload_activations
+            layer = checkpoint_wrapper(layer, offload_to_cpu=offload_to_cpu)
+        # if we are checkpointing, enforce that FSDP always wraps the
+        # checkpointed layer, regardless of layer size
+        min_params_to_wrap = cfg.min_params_to_wrap if not checkpoint else 0
+        layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
+        return layer
 
     def build_group_encoder_layer(self, cfg):
         layer = GTransformerEncoderLayer(cfg, return_fc=self.return_fc)
@@ -135,11 +176,15 @@ class GTransformerEncoder(TransformerEncoderBase):
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
 
-    def forward_embedding(self, src_tokens):
-        # tags for each token
-        src_tags = tokens2tags(self.dictionary, src_tokens, self.eod)
-        x, embed = super().forward_embedding(src_tokens, src_tags)
-        return x, embed, src_tags
+    def get_local_attn_mask(self, src_tags):
+        # Here we generate attention mask for Group Attention according to group tags
+        local_attn_mask = src_tags.unsqueeze(1) != src_tags.unsqueeze(2)
+        local_attn_mask &= 0 != src_tags.unsqueeze(2)
+
+        # broadcast from shape (batch, seq_len, dim) to (batch * num_heads, seq_len, dim)
+        local_attn_mask = local_attn_mask.unsqueeze(1).repeat(1, self.layers[0].self_attn.num_heads, 1, 1)
+        local_attn_mask = local_attn_mask.view(-1, local_attn_mask.size(2), local_attn_mask.size(3))
+        return local_attn_mask
 
     def forward(
         self,
@@ -174,7 +219,7 @@ class GTransformerEncoder(TransformerEncoderBase):
         # compute padding mask
         encoder_padding_mask = src_tokens.eq(self.padding_idx)
         has_pads = torch.tensor(src_tokens.device.type == "xla") or encoder_padding_mask.any()
-        x, encoder_embedding, src_tags = self.forward_embedding(src_tokens, token_embeddings)
+        x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
         # account for padding while computing the representation
         x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x) * has_pads.type_as(x))
@@ -188,9 +233,8 @@ class GTransformerEncoder(TransformerEncoderBase):
         if return_all_hiddens:
             encoder_states.append(x)
 
-        # Here we generate attention mask for Group Attention according to group tags
-        local_attn_mask = src_tags.unsqueeze(1) != src_tags.unsqueeze(2)
-        local_attn_mask &= 0 != src_tags.unsqueeze(2)
+        src_tags = tokens2tags(self.dictionary, src_tokens, self.eod)
+        local_attn_mask = self.get_local_attn_mask(src_tags)
 
         # encoder layers
         for layer in self.layers:
@@ -224,6 +268,7 @@ class GTransformerEncoder(TransformerEncoderBase):
             "encoder_padding_mask": [encoder_padding_mask],  # B x T
             "encoder_embedding": [encoder_embedding],  # B x T x C
             "encoder_states": encoder_states,  # List[T x B x C]
+            "encoder_tags": src_tags,
             "fc_results": fc_results,  # List[T x B x C]
             "src_tokens": [],
             "src_lengths": [src_lengths],

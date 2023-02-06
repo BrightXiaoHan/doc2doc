@@ -6,20 +6,27 @@ from fairseq.models.transformer import TransformerDecoderBase
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
 from torch import Tensor
 
-from .utils import tokens2tags
+from .utils import Linear, tokens2tags
 
 
 class GTransformerDecoderLayer(TransformerDecoderLayerBase):
-    def __init__(self, cfg, *args, **kwargs):
-        super().__init__(cfg, *args, **kwargs)
-        self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
-        self.self_attn_gate = nn.Sequential(nn.Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
-        self.encoder_attn_local = self.build_encoder_attention(self.embed_dim, cfg.decoder_attention_heads, cfg)
-        self.encoder_attn_gate = nn.Sequential(nn.Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
+    def __init__(self, cfg, global_ctx=False, **kwargs):
+        super().__init__(cfg, **kwargs)
+
+        self.global_ctx = global_ctx
+        if global_ctx:
+            self.self_attn_local = self.build_self_attention(self.embed_dim, cfg)
+            self.self_attn_gate = nn.Sequential(Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
+            self.encoder_attn_local = self.build_encoder_attention(self.embed_dim, cfg)
+            self.encoder_attn_gate = nn.Sequential(Linear(self.embed_dim * 2, self.embed_dim), nn.Sigmoid())
 
     def upgrade_state_dict_named(self, state_dict, name):
-        super().upgrade_state_dict_named(state_dict, name)
-        attn_name_map = {"self_attn": "self_attn_global"}
+        if not self.global_ctx:
+            return
+        attn_name_map = {
+            "self_attn": "self_attn_local",
+            "encoder_attn": "encoder_attn_local",
+        }
         for old, new in attn_name_map.items():
             for m in [
                 "in_proj_weight",
@@ -37,6 +44,18 @@ class GTransformerDecoderLayer(TransformerDecoderLayerBase):
                 k_new = "{}.{}.{}".format(name, new, m)
                 if k_old in state_dict and k_new not in state_dict:
                     state_dict[k_new] = state_dict[k_old].clone()
+
+        # if initailized from a normal transformer, we need to add the attn gate
+        for gate_name in ["self_attn_gate", "encoder_attn_gate"]:
+            attn_gate_weight_name = "{}.{}.0.weight".format(name, gate_name)
+            attn_gate_bias_name = "{}.{}.0.bias".format(name, gate_name)
+
+            if attn_gate_weight_name not in state_dict:
+                # init with the original value
+                state_dict[attn_gate_weight_name] = self.self_attn_gate[0].weight.clone()
+
+            if attn_gate_bias_name not in state_dict:
+                state_dict[attn_gate_bias_name] = self.self_attn_gate[0].bias.clone()
 
     def forward(
         self,
@@ -100,27 +119,39 @@ class GTransformerDecoderLayer(TransformerDecoderLayerBase):
         else:
             y = x
 
-        x_global, _ = self.self_attn(
-            query=x,
-            key=y,
-            value=y,
-            key_padding_mask=self_attn_padding_mask,
-            incremental_state=incremental_state,
-            need_weights=False,
-            attn_mask=self_attn_mask,
-        )
+        if self.global_ctx:
+            x_global, _ = self.self_attn(
+                query=x,
+                key=y,
+                value=y,
+                key_padding_mask=self_attn_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=False,
+                attn_mask=self_attn_mask,
+            )
 
-        x_local, _ = self.self_attn_global(
-            query=x,
-            key=y,
-            value=y,
-            key_padding_mask=self_attn_padding_mask,
-            incremental_state=incremental_state,
-            need_weights=False,
-            attn_mask=local_self_attn_mask,
-        )
-        gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
-        x = gate * x_local + (1 - gate) * x_global
+            x_local, _ = self.self_attn_local(
+                query=x,
+                key=y,
+                value=y,
+                key_padding_mask=self_attn_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=False,
+                attn_mask=local_self_attn_mask,
+            )
+            gate = self.self_attn_gate(torch.cat([x_local, x_global], dim=-1))
+            x = gate * x_local + (1 - gate) * x_global
+        else:
+            x, _ = self.self_attn(
+                query=x,
+                key=y,
+                value=y,
+                key_padding_mask=self_attn_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=False,
+                attn_mask=local_self_attn_mask,
+            )
+
         if self.c_attn is not None:
             tgt_len, bsz = x.size(0), x.size(1)
             x = x.view(tgt_len, bsz, self.nh, self.head_dim)
@@ -149,29 +180,43 @@ class GTransformerDecoderLayer(TransformerDecoderLayerBase):
                 assert incremental_state is not None
                 self.encoder_attn._set_input_buffer(incremental_state, saved_state)
 
-            x_local, _ = self.encoder_attn(
-                query=x,
-                key=encoder_out,
-                value=encoder_out,
-                key_padding_mask=encoder_padding_mask,
-                incremental_state=incremental_state,
-                static_kv=True,
-                need_weights=need_attn or (not self.training and self.need_attn),
-                need_head_weights=need_head_weights,
-                attn_mask=local_encoder_attn_mask,
-            )
-            x_global, attn = self.encoder_attn_global(
-                query=x,
-                key=encoder_out,
-                value=encoder_out,
-                key_padding_mask=encoder_padding_mask,
-                incremental_state=incremental_state,
-                static_kv=True,
-                need_weights=need_attn or (not self.training and self.need_attn),
-                need_head_weights=need_head_weights,
-            )
-            gate = self.encoder_attn_gate(torch.cat([x_local, x_global], dim=-1))
-            x = gate * x_local + (1 - gate) * x_global
+            if self.global_ctx:
+                x_local, _ = self.encoder_attn_local(
+                    query=x,
+                    key=encoder_out,
+                    value=encoder_out,
+                    key_padding_mask=encoder_padding_mask,
+                    incremental_state=incremental_state,
+                    static_kv=True,
+                    need_weights=need_attn or (not self.training and self.need_attn),
+                    need_head_weights=need_head_weights,
+                    attn_mask=local_encoder_attn_mask,
+                )
+                x_global, attn = self.encoder_attn(
+                    query=x,
+                    key=encoder_out,
+                    value=encoder_out,
+                    key_padding_mask=encoder_padding_mask,
+                    incremental_state=incremental_state,
+                    static_kv=True,
+                    need_weights=need_attn or (not self.training and self.need_attn),
+                    need_head_weights=need_head_weights,
+                )
+                gate = self.encoder_attn_gate(torch.cat([x_local, x_global], dim=-1))
+                x = gate * x_local + (1 - gate) * x_global
+
+            else:
+                x, attn = self.encoder_attn(
+                    query=x,
+                    key=encoder_out,
+                    value=encoder_out,
+                    key_padding_mask=encoder_padding_mask,
+                    incremental_state=incremental_state,
+                    static_kv=True,
+                    need_weights=need_attn or (not self.training and self.need_attn),
+                    need_head_weights=need_head_weights,
+                    attn_mask=local_encoder_attn_mask,
+                )
 
             x = self.dropout_module(x)
             x = self.residual_connection(x, residual)
@@ -210,9 +255,44 @@ class GTransformerDecoderLayer(TransformerDecoderLayerBase):
 
 class GTransformerDecoder(TransformerDecoderBase):
     def __init__(self, cfg, *args, **kwargs):
+        origin_decoder_layers = cfg.decoder_layers
+        gtransformer_decoder_ctx_layers = cfg.decoder_ctx_layers
+        assert gtransformer_decoder_ctx_layers <= origin_decoder_layers
+        cfg.decoder_layers = origin_decoder_layers - gtransformer_decoder_ctx_layers
         super().__init__(cfg, *args, **kwargs)
-        self.layers.extend([GTransformerDecoderLayer(cfg, no_encoder_attn=True) for _ in range(cfg.decoder.docker_ctx_layers)])
+        cfg.decoder_layers = origin_decoder_layers
+        for _ in range(cfg.decoder_ctx_layers):
+            self.layers.extend([self.build_global_decoder_layer(cfg)])
         self.eod = "[{}]".format(cfg.target_lang)
+
+    def build_decoder_layer(self, cfg, no_encoder_attn=False):
+        layer = GTransformerDecoderLayer(cfg, no_encoder_attn=no_encoder_attn, global_ctx=False)
+        return layer
+
+    def build_global_decoder_layer(self, cfg, no_encoder_attn=False):
+        layer = GTransformerDecoderLayer(cfg, no_encoder_attn=no_encoder_attn, global_ctx=True)
+        return layer
+
+    def get_local_encoder_attn_mask(self, encoder_tags, decoder_tags):
+        # G-Transformer local attention mask for cross-attention
+        attn_mask = encoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
+        attn_mask &= 0 != decoder_tags.unsqueeze(2)
+
+        # broadcast from shape (batch, seq_len, dim) to (batch * num_heads, seq_len, dim)
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, self.layers[0].self_attn.num_heads, 1, 1)
+        attn_mask = attn_mask.view(-1, attn_mask.size(2), attn_mask.size(3))
+        return attn_mask
+
+    def get_local_self_attn_mask(self, decoder_tags):
+        # G-Transformer local attention mask for self-attention
+        attn_mask = decoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
+        attn_mask &= 0 != decoder_tags.unsqueeze(2)
+
+        # broadcast from shape (batch, seq_len, dim) to (batch * num_heads, seq_len, dim)
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, self.layers[0].self_attn.num_heads, 1, 1)
+        attn_mask = attn_mask.view(-1, attn_mask.size(2), attn_mask.size(3))
+        attn_mask = torch.triu(attn_mask, diagonal=1)
+        return attn_mask
 
     def extract_features_scriptable(
         self,
@@ -262,7 +342,6 @@ class GTransformerDecoder(TransformerDecoderBase):
             if positions is not None:
                 positions = positions[:, -1:]
 
-
         # Prevent torchscript exporting issue for dynamic quant embedding
         prev_output_tokens = prev_output_tokens.contiguous()
         # embed tokens and positions
@@ -288,17 +367,11 @@ class GTransformerDecoder(TransformerDecoderBase):
         self_attn_padding_mask: Optional[Tensor] = None
         if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
-        
-        # G-Transformer embed tags
-        prev_output_tags = tokens2tags(self.dictionary, prev_output_tokens, self.eod)
-        decoder_tags = prev_output_tags
 
-        # G-Transformer local attention mask for cross-attention
-        local_encoder_attn_mask = encoder_out.encoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
-        local_encoder_attn_mask &= 0 != decoder_tags.unsqueeze(2)
-        # G-Transformer local attention mask for self-attention
-        local_self_attn_mask = prev_output_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
-        local_self_attn_mask &= 0 != decoder_tags.unsqueeze(2)
+        # G-Transformer embed tags
+        decoder_tags = tokens2tags(self.dictionary, prev_output_tokens, self.eod)
+        local_encoder_attn_mask = self.get_local_encoder_attn_mask(encoder_out["encoder_tags"], decoder_tags)
+        local_self_attn_mask = self.get_local_self_attn_mask(decoder_tags)
 
         # decoder layers
         attn: Optional[Tensor] = None
@@ -306,7 +379,6 @@ class GTransformerDecoder(TransformerDecoderBase):
         for idx, layer in enumerate(self.layers):
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
-                local_self_attn_mask &= self_attn_mask
             else:
                 self_attn_mask = None
 
