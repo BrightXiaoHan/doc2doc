@@ -274,6 +274,10 @@ class GTransformerDecoder(TransformerDecoderBase):
         return layer
 
     def get_local_encoder_attn_mask(self, encoder_tags, decoder_tags):
+        # Handle beamsize
+        beamsize = decoder_tags.size(0) // encoder_tags.size(0)
+        if beamsize > 1:
+            encoder_tags = encoder_tags.repeat(beamsize, 1).view(-1, encoder_tags.size(-1))
         # G-Transformer local attention mask for cross-attention
         attn_mask = encoder_tags.unsqueeze(1) != decoder_tags.unsqueeze(2)
         attn_mask &= 0 != decoder_tags.unsqueeze(2)

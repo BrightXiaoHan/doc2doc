@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -88,7 +88,7 @@ class GTransformerEncoderLayer(TransformerEncoderLayerBase):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-        
+
         # Key changes of GTransformer
         if self.global_ctx:
             x_local, _ = self.self_attn_local(
@@ -186,7 +186,7 @@ class GTransformerEncoder(TransformerEncoderBase):
         local_attn_mask = local_attn_mask.view(-1, local_attn_mask.size(2), local_attn_mask.size(3))
         return local_attn_mask
 
-    def forward(
+    def forward_scriptable(
         self,
         src_tokens,
         src_lengths: Optional[torch.Tensor] = None,
@@ -273,3 +273,8 @@ class GTransformerEncoder(TransformerEncoderBase):
             "src_tokens": [],
             "src_lengths": [src_lengths],
         }
+
+    def reorder_encoder_out(self, encoder_out: Dict[str, List[Tensor]], new_order):
+        new_encoder_out = super().reorder_encoder_out(encoder_out, new_order)
+        new_encoder_out["encoder_tags"] = encoder_out["encoder_tags"]
+        return new_encoder_out
