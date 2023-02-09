@@ -10,8 +10,10 @@ from fairseq.models.transformer.transformer_config import (
     TransformerConfig,
 )
 
-from doc2doc.models.gtransformer.gtransformer_decoder import GTransformerDecoder
-from doc2doc.models.gtransformer.gtransformer_encoder import GTransformerEncoder
+from .gtransformer_decoder import GTransformerDecoder
+from .gtransformer_encoder import GTransformerEncoder
+
+__all__ = ["GTransformerModel"]
 
 
 @dataclass
