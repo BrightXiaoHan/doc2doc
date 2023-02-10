@@ -8,7 +8,7 @@ from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.transformer_layer import TransformerEncoderLayerBase
 from torch import Tensor
 
-from .utils import Linear, tokens2tags
+from .utils import Linear
 
 
 class GTransformerEncoderLayer(TransformerEncoderLayerBase):
@@ -147,7 +147,31 @@ class GTransformerEncoder(TransformerEncoderBase):
         cfg.encoder_layers = origin_encoder_layers
         for _ in range(gtransformer_encoder_ctx_layers):
             self.layers.extend([self.build_group_encoder_layer(cfg)])
-        self.eod = "[{}]".format(cfg.source_lang)
+
+    @staticmethod
+    def tokens2tags(dict, tokens):
+        """
+        generate group-tags according token sequence
+
+        Given a token sequence "Hi . </s> I am a student . </s> I like NLP . <pad> <pad> <pad>"
+        The tags should be "1 1 1 2 2 2 2 2 2 3 3 3 3 3 0 0 0"
+        """
+
+        def _toks2tags(tokens):
+            tags = []
+            next_tag = 1
+            for tok in tokens:
+                if tok in [dict.pad_index]:
+                    tags.append(0)
+                else:
+                    tags.append(next_tag)
+                    if tok == dict.eos_index:  # increase tag per </s>
+                        next_tag += 1
+            return tags
+
+        tok_tags = [_toks2tags(tokens) for tokens in tokens.data.cpu().numpy().tolist()]
+        tok_tags = torch.tensor(tok_tags, dtype=tokens.dtype, device=tokens.device)
+        return tok_tags
 
     def build_encoder_layer(self, cfg):
         layer = GTransformerEncoderLayer(cfg, return_fc=self.return_fc)
@@ -233,7 +257,7 @@ class GTransformerEncoder(TransformerEncoderBase):
         if return_all_hiddens:
             encoder_states.append(x)
 
-        src_tags = tokens2tags(self.dictionary, src_tokens, self.eod)
+        src_tags = self.tokens2tags(self.dictionary, src_tokens)
         local_attn_mask = self.get_local_attn_mask(src_tags)
 
         # encoder layers

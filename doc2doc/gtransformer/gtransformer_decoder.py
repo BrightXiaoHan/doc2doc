@@ -6,7 +6,7 @@ from fairseq.models.transformer import TransformerDecoderBase
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
 from torch import Tensor
 
-from .utils import Linear, tokens2tags
+from .utils import Linear
 
 
 class GTransformerDecoderLayer(TransformerDecoderLayerBase):
@@ -263,7 +263,31 @@ class GTransformerDecoder(TransformerDecoderBase):
         cfg.decoder_layers = origin_decoder_layers
         for _ in range(cfg.decoder_ctx_layers):
             self.layers.extend([self.build_global_decoder_layer(cfg)])
-        self.eod = "[{}]".format(cfg.target_lang)
+
+    @staticmethod
+    def tokens2tags(dict, tokens):
+        """
+        generate group-tags according token sequence
+
+        Suppose we have a token seq "</s> I am a student </s> You are a student <pad>", then the group-tags
+        [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 0]
+        """
+
+        def _toks2tags(tokens):
+            next_tag = 1
+            tags = [next_tag]
+            for tok in tokens[1:]:
+                if tok in [dict.pad_index]:
+                    tags.append(0)
+                else:
+                    if tok == dict.eos_index:  # increase tag per </s>
+                        next_tag += 1
+                    tags.append(next_tag)
+            return tags
+
+        tok_tags = [_toks2tags(tokens) for tokens in tokens.data.cpu().numpy().tolist()]
+        tok_tags = torch.tensor(tok_tags, dtype=tokens.dtype, device=tokens.device)
+        return tok_tags
 
     def build_decoder_layer(self, cfg, no_encoder_attn=False):
         layer = GTransformerDecoderLayer(cfg, no_encoder_attn=no_encoder_attn, global_ctx=False)
@@ -295,7 +319,8 @@ class GTransformerDecoder(TransformerDecoderBase):
         # broadcast from shape (batch, seq_len, dim) to (batch * num_heads, seq_len, dim)
         attn_mask = attn_mask.unsqueeze(1).repeat(1, self.layers[0].self_attn.num_heads, 1, 1)
         attn_mask = attn_mask.view(-1, attn_mask.size(2), attn_mask.size(3))
-        attn_mask = torch.triu(attn_mask, diagonal=1)
+        triu_mask = torch.triu(torch.ones_like(attn_mask[0]), diagonal=1)
+        attn_mask = attn_mask | triu_mask
         return attn_mask
 
     def extract_features_scriptable(
@@ -373,7 +398,7 @@ class GTransformerDecoder(TransformerDecoderBase):
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
         # G-Transformer embed tags
-        decoder_tags = tokens2tags(self.dictionary, prev_output_tokens, self.eod)
+        decoder_tags = self.tokens2tags(self.dictionary, prev_output_tokens)
         local_encoder_attn_mask = self.get_local_encoder_attn_mask(encoder_out["encoder_tags"], decoder_tags)
         local_self_attn_mask = self.get_local_self_attn_mask(decoder_tags)
 
