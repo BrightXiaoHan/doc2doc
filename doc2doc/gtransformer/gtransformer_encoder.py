@@ -300,5 +300,9 @@ class GTransformerEncoder(TransformerEncoderBase):
 
     def reorder_encoder_out(self, encoder_out: Dict[str, List[Tensor]], new_order):
         new_encoder_out = super().reorder_encoder_out(encoder_out, new_order)
-        new_encoder_out["encoder_tags"] = encoder_out["encoder_tags"]
+        if len(encoder_out["encoder_tags"]) == 0:
+            encoder_tags = []
+        else:
+            encoder_tags = encoder_out["encoder_tags"].index_select(0, new_order)
+        new_encoder_out["encoder_tags"] = encoder_tags
         return new_encoder_out
